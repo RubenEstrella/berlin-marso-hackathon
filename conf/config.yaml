@@ -1,0 +1,30 @@
+# Root config. Composes a difficulty (defaults list) + shared params.
+# Override anything on the CLI, e.g.  python eval.py difficulty=hard checkpoint=<path>
+defaults:
+  - difficulty: easy
+  - _self_
+
+seed: 0
+num_envs: 8               # for eval/test; scale up as GPU allows
+device: cuda
+control_mode: pd_ee_delta_pos
+max_episode_steps: 200
+
+# observation mode. This is an IMAGE challenge: the observation is the scene-camera rgb image
+# plus robot proprioception. Defaults to rgb for every difficulty.
+obs_mode: rgb
+
+camera:
+  width: 128
+  height: 128
+
+# the rgb obs comes from a single fixed third-person "scene" camera (the only image input)
+obs_camera: scene
+
+# checkpoint path (for eval.py / the judge)
+checkpoint: null
+# eval config file path (eval.py only)
+eval_config: null
+# policy entrypoint "module:function" — required for eval.py / the judge
+# e.g.  policy=warehouse_sort.il_policy:load_dp_rgb
+policy: null

@@ -1,0 +1,13 @@
+# @package _global_
+difficulty:
+  name: medium
+  num_parcels: 4
+  fixed_poses: false
+
+randomization:
+  parcel_pose:
+    xy_jitter: [-0.015, 0.015]     # small spawn jitter within the inbound zone (m)
+    yaw_jitter: [0.0, 0.0]         # fixed orientation (boxes always axis-aligned)
+  bin_position:
+    side_swap_prob: 0.0
+    xy_jitter: [0.0, 0.0]

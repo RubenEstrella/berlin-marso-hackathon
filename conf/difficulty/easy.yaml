@@ -1,0 +1,15 @@
+# @package _global_
+# Easy is ALWAYS fully fixed: same 2 parcels in the same positions every episode, bins
+# never swap. This is the guaranteed-solvable baseline level.
+difficulty:
+  name: easy
+  num_parcels: 2
+  fixed_poses: true
+
+randomization:
+  parcel_pose:
+    xy_jitter: [0.0, 0.0]
+    yaw_jitter: [0.0, 0.0]
+  bin_position:
+    side_swap_prob: 0.0
+    xy_jitter: [0.0, 0.0]

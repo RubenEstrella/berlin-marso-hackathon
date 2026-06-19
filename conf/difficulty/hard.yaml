@@ -1,0 +1,16 @@
+# @package _global_
+# Hard = medium with more parcels (6) plus the bins occasionally swapping sides, so the policy
+# must route by tag colour rather than memorising a fixed side. Orientation jitter is very
+# slight and positions vary only a little.
+difficulty:
+  name: hard
+  num_parcels: 6
+  fixed_poses: false
+
+randomization:
+  parcel_pose:
+    xy_jitter: [-0.02, 0.02]       # small spawn jitter within the inbound zone (m)
+    yaw_jitter: [-0.1, 0.1]        # very slight orientation jitter (rad, z-only ~6 deg)
+  bin_position:
+    side_swap_prob: 0.5            # red/blue bins swap sides in ~half of episodes
+    xy_jitter: [0.0, 0.0]

@@ -1,0 +1,29 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# run outputs / checkpoints
+outputs/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# editor / local settings
+.vscode/
+.claude/
+
+# IL track generated artifacts (checkpoints already covered by *.pt)
+il/videos/
+*.h5
+*.mp4
+# Demo datasets (rgb) are large and exceed GitHub's file-size limit, so they are NOT in git —
+# they're hosted as a Release asset and fetched with il/download_demos.py (see README). Only the
+# small demo media (gif/mp4) ships in the repo.
+!media/*_demo.mp4
+
+# run logs (training/eval/gen stdout captured to files)
+*.log
+
