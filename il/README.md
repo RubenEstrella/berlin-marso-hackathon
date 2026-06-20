@@ -62,10 +62,11 @@ Useful flags: `--no-replay` (raw demos only), `--no-media` (skip the mp4/gif), `
 ## Step 2 — Train
 
 ```bash
-pixi run python il/train.py method=dp_rgb demo_dir=easy      # RGB Diffusion Policy (the template)
+pixi run python il/train.py method=dp_rgb demo_dir=all       # balanced easy + medium + hard
 ```
 
-To train on a different level pass `demo_dir=<level>`:
+`demo_dir=all` samples each difficulty with equal probability, regardless of trajectory
+length. To train on one level, pass `demo_dir=<level>`:
 ```bash
 pixi run python il/train.py method=dp_rgb demo_dir=medium
 ```
@@ -75,8 +76,9 @@ Override any hyperparameter on the CLI:
 pixi run python il/train.py method=dp_rgb flags.total_iters=50000 flags.eval_freq=5000
 ```
 
-Checkpoints land at `il/baselines/diffusion_policy/runs/<exp_name>/checkpoints/` (the rgb
-method's `exp_name` is `warehouse_rgb_dp`).
+Checkpoints land at `il/baselines/diffusion_policy/runs/<run_name>/checkpoints/`. Run names
+include the seed and timestamp by default, preventing repeated experiments from overwriting
+checkpoints and TensorBoard logs.
 
 **Datasets in a custom location** (e.g. the mounted Kaggle competition data, not `il/demos/`): pass `demo_path=`
 the full path to the `.h5` — keep the matching `.json` in the same folder:
@@ -99,6 +101,19 @@ pixi run python eval.py difficulty=easy \
 
 The rgb observation has the **same shape at every difficulty**, so one trained checkpoint can be
 evaluated on easy, medium, and hard.
+
+Evaluate all levels and calculate the weighted competition score:
+
+```bash
+pixi run python eval_all.py --checkpoint <checkpoint.pt>
+```
+
+Run keypoint-count and execution-horizon ablations:
+
+```bash
+pixi run python il/run_ablations.py train --num-kp 32 64 --total-iters 30000
+pixi run python il/run_ablations.py eval --checkpoint <checkpoint.pt> --horizons 2 4 8
+```
 
 ---
 

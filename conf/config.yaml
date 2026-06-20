@@ -7,6 +7,7 @@ defaults:
 seed: 0
 num_envs: 8               # for eval/test; scale up as GPU allows
 device: cuda
+sim_backend: gpu           # automatically falls back to physx_cpu on native Windows
 control_mode: pd_ee_delta_pos
 max_episode_steps: 200
 

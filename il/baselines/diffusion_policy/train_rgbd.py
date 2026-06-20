@@ -3,6 +3,7 @@ ALGO_NAME = "BC_Diffusion_rgbd_UNet"
 import os
 import random
 import time
+import types
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -24,7 +25,7 @@ from gymnasium import spaces
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
-from torch.utils.data.sampler import BatchSampler, RandomSampler
+from torch.utils.data.sampler import BatchSampler, RandomSampler, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
@@ -40,6 +41,8 @@ from diffusion_policy.utils import (IterationBasedBatchSampler,
 class Args:
     exp_name: Optional[str] = None
     """the name of this experiment"""
+    unique_run_name: bool = True
+    """Append seed and timestamp to exp_name so repeated runs never overwrite each other."""
     seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
@@ -71,6 +74,8 @@ class Args:
     # Diffusion Policy specific arguments
     lr: float = 1e-4
     """the learning rate of the diffusion policy"""
+    learning_rate: Optional[float] = None
+    """Readable alias for --lr; when set, this value wins."""
     obs_horizon: int = 2  # Seems not very important in ManiSkill, 1, 2, 4 work well
     act_horizon: int = 8  # Seems not very important in ManiSkill, 4, 8, 15 work well
     pred_horizon: int = (
@@ -93,6 +98,16 @@ class Args:
     """RGB encoder: "plain_conv" (vendored) or "resnet18" (ResNet18 + SpatialSoftmax keypoints)."""
     num_kp: int = 32
     """SpatialSoftmax keypoints (resnet18 encoder); 2*num_kp coords localise parcels+bins+gripper."""
+    input_resolution: int = 160
+    """Resize encoder inputs; larger values give SpatialSoftmax a finer feature grid."""
+    aux_color_weight: float = 0.1
+    """Weight for image-derived red/blue centroid supervision; set to 0 to disable."""
+    aug_shift_px: float = 4.0
+    """Maximum random image translation during training, in pixels. Set to 0 to disable."""
+    aug_brightness: float = 0.10
+    """Uniform brightness jitter strength during training. Set to 0 to disable."""
+    aug_contrast: float = 0.10
+    """Uniform contrast jitter strength during training. Set to 0 to disable."""
     # WarehouseSort scene knobs (so the eval env matches the demos). Defaults = easy.
     num_parcels: int = 2
     max_episode_steps: Optional[int] = None
@@ -134,7 +149,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         self.include_rgb = include_rgb
         self.include_depth = include_depth
         from diffusion_policy.utils import load_demo_dataset
-        trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
+        data_paths = data_path if isinstance(data_path, (list, tuple)) else [data_path]
+        trajectories = {"observations": [], "actions": []}
+        trajectory_sources = []
+        for source_idx, path in enumerate(data_paths):
+            source = load_demo_dataset(path, num_traj=num_traj, concat=False)
+            trajectories["observations"].extend(source["observations"])
+            trajectories["actions"].extend(source["actions"])
+            trajectory_sources.extend([source_idx] * len(source["actions"]))
+            print(f"Loaded source {source_idx + 1}/{len(data_paths)}: {path}", flush=True)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
         print("Raw trajectory loaded, beginning observation pre-processing...")
@@ -142,9 +165,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
         for obs_traj_dict in trajectories["observations"]:
-            _obs_traj_dict = reorder_keys(
-                obs_traj_dict, obs_space
-            )  # key order in demo is different from key order in env obs
+            _obs_traj_dict = (
+                reorder_keys(obs_traj_dict, obs_space)
+                if obs_space is not None else obs_traj_dict
+            )
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
@@ -188,6 +212,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             args.pred_horizon,
         )
         self.slices = []
+        self.slice_sources = []
         num_traj = len(trajectories["actions"])
         total_transitions = 0
         for traj_idx in range(num_traj):
@@ -204,10 +229,16 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             pad_after = pred_horizon - obs_horizon
             # Pad after the trajectory, so all the observations are utilized in training
             # Note that in the original code, pad_after = act_horizon - 1, but I think this is not the best choice
-            self.slices += [
+            traj_slices = [
                 (traj_idx, start, start + pred_horizon)
                 for start in range(-pad_before, L - pred_horizon + pad_after)
             ]  # slice indices follow convention [start, end)
+            self.slices += traj_slices
+            self.slice_sources += [trajectory_sources[traj_idx]] * len(traj_slices)
+
+        source_counts = np.bincount(self.slice_sources, minlength=len(data_paths))
+        self.sample_weights = [1.0 / source_counts[source] for source in self.slice_sources]
+        print(f"Balanced source slice counts: {source_counts.tolist()}", flush=True)
 
         print(
             f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}"
@@ -278,20 +309,30 @@ class Agent(nn.Module):
 
         visual_feature_dim = 256
         enc = getattr(args, "visual_encoder", "plain_conv")
-        if enc == "resnet18":
+        if enc in ("resnet18", "resnet50"):
             # ResNet18 + SpatialSoftmax: encodes object/gripper LOCATIONS as keypoint coords
             # (see lerobot_encoder). Best for spatial pick-and-place.
-            from diffusion_policy.lerobot_encoder import ResNet18SpatialSoftmax
-            self.visual_encoder = ResNet18SpatialSoftmax(
+            from diffusion_policy.lerobot_encoder import ResNetSpatialSoftmax
+            self.visual_encoder = ResNetSpatialSoftmax(
                 in_channels=total_visual_channels, out_dim=visual_feature_dim,
-                num_kp=getattr(args, "num_kp", 32),
+                num_kp=getattr(args, "num_kp", 32), backbone=enc,
             )
+            self.normalize_rgb = True
         else:
             # pool_feature_map=False: flatten the full 8x8 conv feature map instead of global
             # max-pooling it to 1x1 (which discards WHERE objects are and makes the policy collapse).
             self.visual_encoder = PlainConv(
                 in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=False
             )
+            self.normalize_rgb = False
+        self.aug_shift_px = float(getattr(args, "aug_shift_px", 0.0))
+        self.aug_brightness = float(getattr(args, "aug_brightness", 0.0))
+        self.aug_contrast = float(getattr(args, "aug_contrast", 0.0))
+        self.input_resolution = int(getattr(args, "input_resolution", 128))
+        self.aux_color_weight = float(getattr(args, "aux_color_weight", 0.0))
+        self.color_head = (
+            nn.Linear(visual_feature_dim, 4) if self.aux_color_weight > 0 else None
+        )
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
             global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
@@ -307,9 +348,71 @@ class Agent(nn.Module):
             prediction_type="epsilon",  # predict noise (instead of denoised action)
         )
 
-    def encode_obs(self, obs_seq, eval_mode):
+    def _augment_rgb(self, rgb):
+        """Apply one random transform per sequence, shared by all history frames."""
+        b, t, c, h, w = rgb.shape
+        if self.aug_shift_px > 0:
+            theta = torch.eye(2, 3, device=rgb.device, dtype=rgb.dtype)[None].repeat(b, 1, 1)
+            shift = torch.empty((b, 2), device=rgb.device).uniform_(
+                -self.aug_shift_px, self.aug_shift_px
+            )
+            theta[:, 0, 2] = 2.0 * shift[:, 0] / max(w - 1, 1)
+            theta[:, 1, 2] = 2.0 * shift[:, 1] / max(h - 1, 1)
+            theta = theta[:, None].expand(-1, t, -1, -1).reshape(b * t, 2, 3)
+            flat = rgb.reshape(b * t, c, h, w)
+            grid = F.affine_grid(theta, flat.shape, align_corners=False)
+            rgb = F.grid_sample(
+                flat, grid, mode="bilinear", padding_mode="border", align_corners=False
+            ).reshape(b, t, c, h, w)
+
+        if self.aug_brightness > 0:
+            brightness = torch.empty((b, 1, 1, 1, 1), device=rgb.device).uniform_(
+                1.0 - self.aug_brightness, 1.0 + self.aug_brightness
+            )
+            rgb = rgb * brightness
+        if self.aug_contrast > 0:
+            contrast = torch.empty((b, 1, 1, 1, 1), device=rgb.device).uniform_(
+                1.0 - self.aug_contrast, 1.0 + self.aug_contrast
+            )
+            mean = rgb.mean(dim=(-3, -2, -1), keepdim=True)
+            rgb = (rgb - mean) * contrast + mean
+        return rgb.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _color_centroids(rgb):
+        """Return red and blue (x, y) centroids in [-1, 1] from RGB pixels."""
+        red = (rgb[:, :, 0] > rgb[:, :, 1] * 1.35) & (rgb[:, :, 0] > rgb[:, :, 2] * 1.2)
+        blue = (rgb[:, :, 2] > rgb[:, :, 1] * 1.2) & (rgb[:, :, 2] > rgb[:, :, 0] * 1.35)
+        h, w = rgb.shape[-2:]
+        ys, xs = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h, device=rgb.device, dtype=rgb.dtype),
+            torch.linspace(-1.0, 1.0, w, device=rgb.device, dtype=rgb.dtype),
+            indexing="ij",
+        )
+
+        def centroid(mask):
+            weight = mask.to(rgb.dtype)
+            denom = weight.sum(dim=(-2, -1)).clamp_min(1.0)
+            return torch.stack(
+                ((weight * xs).sum(dim=(-2, -1)) / denom,
+                 (weight * ys).sum(dim=(-2, -1)) / denom),
+                dim=-1,
+            )
+
+        return torch.cat((centroid(red), centroid(blue)), dim=-1)
+
+    def encode_obs(self, obs_seq, eval_mode, return_aux=False):
+        color_target = None
         if self.include_rgb:
             rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
+            if not eval_mode:
+                rgb = self._augment_rgb(rgb)
+            if return_aux and self.color_head is not None:
+                color_target = self._color_centroids(rgb)
+            if self.normalize_rgb:
+                mean = rgb.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
+                std = rgb.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
+                rgb = (rgb - mean) / std
             img_seq = rgb
         if self.include_depth:
             depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
@@ -318,8 +421,11 @@ class Agent(nn.Module):
             img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W), C=4*k
         batch_size = img_seq.shape[0]
         img_seq = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
-        if hasattr(self, "aug") and not eval_mode:
-            img_seq = self.aug(img_seq)  # (B*obs_horizon, C, H, W)
+        if self.normalize_rgb and img_seq.shape[-2:] != (self.input_resolution, self.input_resolution):
+            img_seq = F.interpolate(
+                img_seq, size=(self.input_resolution, self.input_resolution),
+                mode="bilinear", align_corners=False,
+            )
         visual_feature = self.visual_encoder(img_seq)  # (B*obs_horizon, D)
         visual_feature = visual_feature.reshape(
             batch_size, self.obs_horizon, visual_feature.shape[1]
@@ -327,14 +433,17 @@ class Agent(nn.Module):
         feature = torch.cat(
             (visual_feature, obs_seq["state"]), dim=-1
         )  # (B, obs_horizon, D+obs_state_dim)
-        return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        feature = feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        if return_aux:
+            return feature, visual_feature, color_target
+        return feature
 
     def compute_loss(self, obs_seq, action_seq):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
-        obs_cond = self.encode_obs(
-            obs_seq, eval_mode=False
+        obs_cond, visual_feature, color_target = self.encode_obs(
+            obs_seq, eval_mode=False, return_aux=True
         )  # (B, obs_horizon * obs_dim)
 
         # sample noise to add to actions
@@ -354,7 +463,11 @@ class Agent(nn.Module):
             noisy_action_seq, timesteps, global_cond=obs_cond
         )
 
-        return F.mse_loss(noise_pred, noise)
+        loss = F.mse_loss(noise_pred, noise)
+        if self.color_head is not None and color_target is not None:
+            color_pred = torch.tanh(self.color_head(visual_feature))
+            loss = loss + self.aux_color_weight * F.mse_loss(color_pred, color_target)
+        return loss
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -408,6 +521,18 @@ def save_ckpt(run_name, tag):
         {
             "agent": agent.state_dict(),
             "ema_agent": ema_agent.state_dict(),
+            "model_config": {
+                "obs_horizon": args.obs_horizon,
+                "act_horizon": args.act_horizon,
+                "pred_horizon": args.pred_horizon,
+                "diffusion_step_embed_dim": args.diffusion_step_embed_dim,
+                "unet_dims": list(args.unet_dims),
+                "n_groups": args.n_groups,
+                "visual_encoder": args.visual_encoder,
+                "num_kp": args.num_kp,
+                "input_resolution": args.input_resolution,
+                "aux_color_weight": args.aux_color_weight,
+            },
         },
         f"runs/{run_name}/checkpoints/{tag}.pt",
     )
@@ -416,18 +541,25 @@ def save_ckpt(run_name, tag):
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
+    timestamp = int(time.time())
     if args.exp_name is None:
-        args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        base_name = os.path.basename(__file__)[: -len(".py")]
     else:
-        run_name = args.exp_name
+        base_name = args.exp_name
+    run_name = (f"{base_name}__seed{args.seed}__{timestamp}"
+                if args.unique_run_name else base_name)
 
-    if args.demo_path.endswith(".h5"):
+    demo_paths = [p.strip() for p in args.demo_path.split(",") if p.strip()]
+    if not demo_paths or any(not path.endswith(".h5") for path in demo_paths):
+        raise ValueError("--demo-path must be one or more comma-separated .h5 files")
+    demo_infos = []
+    for demo_path in demo_paths:
         import json
 
-        json_file = args.demo_path[:-2] + "json"
+        json_file = demo_path[:-2] + "json"
         with open(json_file, "r") as f:
             demo_info = json.load(f)
+            demo_infos.append(demo_info)
             if "control_mode" in demo_info["env_info"]["env_kwargs"]:
                 control_mode = demo_info["env_info"]["env_kwargs"]["control_mode"]
             elif "control_mode" in demo_info["episodes"][0]:
@@ -441,8 +573,9 @@ if __name__ == "__main__":
     # from the demo's recorded env_kwargs (num parcels, bins, distance, pose randomisation, camera)
     # so eval renders exactly what the policy was trained on (no manual flag duplication).
     _demo_scene_kwargs = {}
-    if args.demo_path.endswith(".h5") and args.env_id.startswith("WarehouseSort"):
-        _dk = demo_info["env_info"]["env_kwargs"]
+    if demo_infos and args.env_id.startswith("WarehouseSort"):
+        # For mixed training, evaluate on the most difficult (last) dataset's scene.
+        _dk = demo_infos[-1]["env_info"]["env_kwargs"]
         for _k in ("num_parcels", "fixed_poses", "randomization", "obs_camera"):
             if _k in _dk:
                 _demo_scene_kwargs[_k] = _dk[_k]
@@ -455,6 +588,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    offline_training = os.name == "nt"
 
     # create evaluation environment
     env_kwargs = dict(
@@ -471,15 +605,20 @@ if __name__ == "__main__":
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = dict(obs_horizon=args.obs_horizon)
-    envs = make_eval_envs(
-        args.env_id,
-        args.num_eval_envs,
-        args.sim_backend,
-        env_kwargs,
-        other_kwargs,
-        video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
-    )
+    envs = None
+    if not offline_training:
+        envs = make_eval_envs(
+            args.env_id,
+            args.num_eval_envs,
+            args.sim_backend,
+            env_kwargs,
+            other_kwargs,
+            video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
+            wrappers=[FlattenRGBDObservationWrapper],
+        )
+    else:
+        print("[train] Windows native mode: offline training enabled; simulator eval disabled",
+              flush=True)
 
     if args.track:
         import wandb
@@ -509,29 +648,38 @@ if __name__ == "__main__":
             np.transpose, axes=(0, 3, 1, 2)
         ),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth = "rgbd" in args.demo_path
+        depth = any("rgbd" in path for path in demo_paths)
     )
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
     # (use the SAME sim backend as the eval envs so this throwaway env doesn't spin up a CPU PhysX
     # system; eval itself runs on args.sim_backend, i.e. GPU here)
-    tmp_env = gym.make(args.env_id, sim_backend=args.sim_backend, **env_kwargs)
-    orignal_obs_space = tmp_env.observation_space
-    # determine whether the env will return rgb and/or depth data
-    include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
-    include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
-    tmp_env.close()
+    if offline_training:
+        orignal_obs_space = None
+        include_rgb = "rgb" in args.obs_mode
+        include_depth = "depth" in args.obs_mode
+    else:
+        tmp_env = gym.make(args.env_id, sim_backend=args.sim_backend, **env_kwargs)
+        orignal_obs_space = tmp_env.observation_space
+        include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
+        include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
+        tmp_env.close()
 
     dataset = SmallDemoDataset_DiffusionPolicy(
-        data_path=args.demo_path,
+        data_path=demo_paths,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
         include_rgb=include_rgb,
         include_depth=include_depth,
-        device=device,
+        device=torch.device("cpu"),
         num_traj=args.num_demos
     )
-    sampler = RandomSampler(dataset, replacement=False)
+    if len(demo_paths) > 1:
+        sampler = WeightedRandomSampler(
+            dataset.sample_weights, num_samples=len(dataset), replacement=True
+        )
+    else:
+        sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     train_dataloader = DataLoader(
@@ -540,12 +688,30 @@ if __name__ == "__main__":
         num_workers=args.num_dataload_workers,
         worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
         persistent_workers=(args.num_dataload_workers > 0),
+        pin_memory=(device.type == "cuda"),
     )
 
-    agent = Agent(envs, args).to(device)
+    if envs is None:
+        sample = dataset[0]
+        state_dim = sample["observations"]["state"].shape[-1]
+        _, channels, height, width = sample["observations"]["rgb"].shape
+        action_dim = sample["actions"].shape[-1]
+        model_env = types.SimpleNamespace(
+            single_observation_space=spaces.Dict({
+                "state": spaces.Box(-np.inf, np.inf, (args.obs_horizon, state_dim), np.float32),
+                "rgb": spaces.Box(0, 255, (args.obs_horizon, height, width, channels), np.uint8),
+            }),
+            single_action_space=spaces.Box(-1.0, 1.0, (action_dim,), np.float32),
+        )
+    else:
+        model_env = envs
+
+    agent = Agent(model_env, args).to(device)
 
     optimizer = optim.AdamW(
-        params=agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
+        params=agent.parameters(),
+        lr=args.learning_rate if args.learning_rate is not None else args.lr,
+        betas=(0.95, 0.999), weight_decay=1e-6,
     )
 
     # Cosine LR schedule with linear warmup
@@ -560,7 +726,7 @@ if __name__ == "__main__":
     # accelerates training and improves stability
     # holds a copy of the model weights
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
-    ema_agent = Agent(envs, args).to(device)
+    ema_agent = Agent(model_env, args).to(device)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
@@ -568,6 +734,10 @@ if __name__ == "__main__":
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
         if iteration % args.eval_freq == 0:
+            if envs is None:
+                save_ckpt(run_name, "latest")
+                print("[train] offline checkpoint saved (simulator eval unavailable on Windows)")
+                return
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
@@ -609,6 +779,11 @@ if __name__ == "__main__":
 
         # forward and compute loss
         last_tick = time.time()
+        data_batch = {
+            "observations": {k: v.to(device, non_blocking=True)
+                             for k, v in data_batch["observations"].items()},
+            "actions": data_batch["actions"].to(device, non_blocking=True),
+        }
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)
@@ -642,5 +817,6 @@ if __name__ == "__main__":
     evaluate_and_save_best(args.total_iters)
     log_metrics(args.total_iters)
 
-    envs.close()
+    if envs is not None:
+        envs.close()
     writer.close()

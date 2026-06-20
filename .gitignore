@@ -4,6 +4,9 @@
 
 # run outputs / checkpoints
 outputs/
+il/baselines/diffusion_policy/runs/
+*.pt
+events.out.tfevents.*
 
 # python
 __pycache__/
@@ -22,6 +25,7 @@ il/videos/
 # Demo datasets (rgb) are large and exceed GitHub's file-size limit, so they are NOT in git —
 # they're hosted as a Release asset and fetched with il/download_demos.py (see README). Only the
 # small demo media (gif/mp4) ships in the repo.
+il/demos/
 !media/*_demo.mp4
 
 # run logs (training/eval/gen stdout captured to files)

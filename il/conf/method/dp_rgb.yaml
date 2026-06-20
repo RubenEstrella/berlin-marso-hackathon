@@ -6,19 +6,26 @@ baseline_dir: diffusion_policy
 script: train_rgbd.py
 demo_kind: rgb
 flags:
+  learning_rate: 8e-4
   obs_mode: rgb
-  obs_camera: scene
-  visual_encoder: resnet18
+  obs_camera: arm
+  visual_encoder: resnet50
   num_kp: 32
+  input_resolution: 160
+  aux_color_weight: 0.10
+  aug_shift_px: 4
+  aug_brightness: 0.10
+  aug_contrast: 0.10
   total_iters: 30000
-  batch_size: 128
+  batch_size: 64
   obs_horizon: 2
-  act_horizon: 8
-  pred_horizon: 16
+  act_horizon: 4
+  pred_horizon: 12
   num_eval_envs: 4
   num_eval_episodes: 8
   eval_freq: 5000
   log_freq: 1000
-  save_freq: 10000
+  save_freq: 2000
   capture_video: true
   exp_name: warehouse_rgb_dp
+  unique_run_name: true

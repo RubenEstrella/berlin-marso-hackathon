@@ -59,19 +59,24 @@ def _bn_to_gn(module, num_groups=16):
             _bn_to_gn(child, num_groups)
 
 
-class ResNet18SpatialSoftmax(nn.Module):
-    """ResNet18 trunk (-> 8x8 feature map) + SpatialSoftmax + Linear -> out_dim."""
+class ResNetSpatialSoftmax(nn.Module):
+    """ResNet trunk through layer3 + SpatialSoftmax + Linear -> out_dim."""
 
-    def __init__(self, in_channels=3, out_dim=256, num_kp=32, pretrained=True):
+    def __init__(self, in_channels=3, out_dim=256, num_kp=32, pretrained=True,
+                 backbone="resnet18"):
         super().__init__()
-        from torchvision.models import resnet18
+        from torchvision.models import resnet18, resnet50
+        builders = {"resnet18": (resnet18, 256), "resnet50": (resnet50, 1024)}
+        if backbone not in builders:
+            raise ValueError(f"unsupported ResNet backbone: {backbone}")
+        builder, feat_channels = builders[backbone]
         try:
             weights = "IMAGENET1K_V1" if pretrained else None
-            net = resnet18(weights=weights)
+            net = builder(weights=weights)
         except Exception as e:                     # offline / no weights cache -> train from scratch
-            print(f"[lerobot_encoder] pretrained resnet18 unavailable ({e}); using random init",
+            print(f"[lerobot_encoder] pretrained {backbone} unavailable ({e}); using random init",
                   flush=True)
-            net = resnet18(weights=None)
+            net = builder(weights=None)
         if in_channels != 3:                       # adapt first conv for non-RGB stacks
             net.conv1 = nn.Conv2d(in_channels, 64, 7, stride=2, padding=3, bias=False)
         # trunk up to layer3 -> for a 128x128 input this yields a (256, 8, 8) feature map
@@ -82,7 +87,6 @@ class ResNet18SpatialSoftmax(nn.Module):
             net.layer1, net.layer2, net.layer3,
         )
         _bn_to_gn(self.trunk)
-        feat_channels = 256
         self.spatial_softmax = SpatialSoftmax(feat_channels, num_kp=num_kp)
         self.fc = nn.Sequential(nn.Linear(2 * num_kp, out_dim), nn.ReLU())
 
@@ -90,3 +94,10 @@ class ResNet18SpatialSoftmax(nn.Module):
         feat = self.trunk(image)
         kp = self.spatial_softmax(feat)
         return self.fc(kp)
+
+
+class ResNet18SpatialSoftmax(ResNetSpatialSoftmax):
+    """Backward-compatible name used by older checkpoints and imports."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, backbone="resnet18", **kwargs)

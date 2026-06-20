@@ -1,5 +1,6 @@
 """Shared helpers for eval.py / the judge: env construction, config logging, rollout."""
 
+import os
 import subprocess
 from typing import Optional
 
@@ -13,12 +14,15 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 
 def _gym_make(cfg, obs_mode, randomization, n, render_mode):
+    sim_backend = cfg.get("sim_backend", "gpu")
+    if os.name == "nt" and sim_backend == "gpu":
+        sim_backend = "physx_cpu"
     return gym.make(
         "WarehouseSort-v1",
         num_envs=n,
         obs_mode=obs_mode,
         control_mode=cfg.control_mode,
-        sim_backend="gpu",
+        sim_backend=sim_backend,
         render_mode=render_mode,
         reward_mode="sparse",
         max_episode_steps=cfg.max_episode_steps,
@@ -77,6 +81,8 @@ def rollout_metrics(env, agent, device, n_episodes, seeds, max_steps, determinis
         if take < nb:
             batch_seeds = batch_seeds + all_seeds[: nb - take]
         obs, _ = env.reset(seed=batch_seeds)
+        if hasattr(agent, "reset"):
+            agent.reset()
         obs = to_device(obs, device)
         for _ in range(max_steps - 1):
             obs, _, _, _, _ = env.step(agent.act(obs, deterministic=deterministic))
@@ -149,6 +155,8 @@ def record_eval_video(cfg, obs_mode, randomization, agent, device, out_dir,
         video_fps=20, max_steps_per_video=cfg.max_episode_steps,
     )
     obs, _ = env.reset(seed=seed)
+    if hasattr(agent, "reset"):
+        agent.reset()
     steps = max_steps or cfg.max_episode_steps
     for _ in range(steps):
         obs, _, _, _, _ = env.step(agent.act(to_device(obs, device), deterministic=True))

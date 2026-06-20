@@ -1,20 +1,20 @@
 [workspace]
 channels = ["conda-forge"]
 name = "marso_hackathon"
-platforms = ["linux-64"]
+platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 
 [tasks]
+install = "python -m pip install -e ."
 test = "python test.py"
 eval = "python eval.py"
 
 [dependencies]
 python = "3.12.*"
+pip = "*"
+setuptools = "<82"
 
 [pypi-dependencies]
-# pinned to exact versions — edit here, then re-run `pixi install` to update pixi.lock
-torch          = "==2.12.0"
-torchvision    = "==0.27.0"
 mani-skill     = "==3.0.1"
 sapien         = "==3.0.3"
 diffusers      = "==0.38.0"
@@ -26,4 +26,19 @@ transforms3d   = "==0.4.2"
 tyro           = "*"
 matplotlib     = "*"
 tensorboard    = "*"
+kagglehub      = "*"
 warehouse_sort = {path = ".", editable = true}
+
+[target.linux-64.pypi-dependencies]
+torch = "==2.12.0"
+torchvision = "==0.27.0"
+
+[target.win-64.pypi-dependencies]
+torch = { version = "==2.12.0+cu130", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.27.0+cu130", index = "https://download.pytorch.org/whl/cu130" }
+
+[target.win-64.dependencies]
+pinocchio = ">=4.0.0,<5"
+
+[target.win-64.activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"

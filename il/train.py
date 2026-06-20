@@ -28,6 +28,11 @@ def _demo_path(demo_dir, kind):
     return os.path.join(d, f"trajectory.{kind}.pd_ee_delta_pos.physx_cuda.h5")
 
 
+def _demo_paths(demo_dir, kind):
+    levels = ["easy", "medium", "hard"] if demo_dir == "all" else [demo_dir]
+    return [_demo_path(level, kind) for level in levels]
+
+
 def _flags_to_cli(flags: dict):
     """method.flags (underscore keys) -> vendored tyro CLI args.
     bool True -> --flag, bool False -> --no-flag; everything else -> --flag value."""
@@ -43,14 +48,26 @@ def _flags_to_cli(flags: dict):
 
 @hydra.main(version_base=None, config_path="conf", config_name="train")
 def main(cfg):
-    demo = cfg.demo_path or _demo_path(cfg.get("demo_dir", "easy"), cfg.demo_kind)
-    if not os.path.exists(demo):
-        sys.exit(f"demo dataset not found: {demo}\n  run: pixi run python il/gen_demos.py "
-                 f"--difficulty {cfg.get('demo_dir', 'easy')}")
+    demo_dir = cfg.get("demo_dir", "easy")
+    demos = ([p.strip() for p in str(cfg.demo_path).split(",") if p.strip()]
+             if cfg.demo_path else _demo_paths(demo_dir, cfg.demo_kind))
+    missing = [p for p in demos if not os.path.exists(p)]
+    if missing:
+        sys.exit("demo dataset(s) not found:\n  " + "\n  ".join(missing)
+                 + "\n  run: pixi run python il/download_demos.py")
+    sim_backend = cfg.sim_backend
+    if os.name == "nt" and sim_backend == "gpu":
+        sim_backend = "physx_cpu"
+        print("[il/train] Windows detected: offline CUDA training; simulator eval disabled",
+              flush=True)
     common = ["--env-id", cfg.env_id, "--control-mode", cfg.control_mode,
-              "--sim-backend", cfg.sim_backend, "--max-episode-steps", str(cfg.max_episode_steps)]
+              "--sim-backend", sim_backend, "--max-episode-steps", str(cfg.max_episode_steps)]
     flags = OmegaConf.to_container(cfg.flags, resolve=True)
-    cmd = [sys.executable, cfg.script, "--demo-path", demo] + common + _flags_to_cli(flags)
+    if os.name == "nt" and int(flags.get("batch_size", 16)) > 16:
+        print(f"[il/train] limiting batch size {flags['batch_size']} -> 16 for Windows GPU memory",
+              flush=True)
+        flags["batch_size"] = 16
+    cmd = [sys.executable, cfg.script, "--demo-path", ",".join(demos)] + common + _flags_to_cli(flags)
     cwd = os.path.join(HERE, "baselines", cfg.baseline_dir)
     method = hydra.core.hydra_config.HydraConfig.get().runtime.choices.get("method", cfg.script)
     print(f"[il/train] method={method}\n"

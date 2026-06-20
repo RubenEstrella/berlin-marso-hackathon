@@ -16,6 +16,7 @@ Critical behaviour:
 """
 
 import os
+import sys
 
 import hydra
 import torch
@@ -28,6 +29,11 @@ from warehouse_sort.utils import (
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg):
+    if os.name == "nt" and cfg.obs_mode == "rgb":
+        sys.exit(
+            "Native Windows training is supported, but SAPIEN 3.0.3 RGB rendering crashes "
+            "on Windows. Evaluate checkpoints in WSL, Colab, or the Linux judge."
+        )
     assert cfg.checkpoint, "pass checkpoint=<path to ckpt.pt>"
     assert cfg.get("eval_config"), "pass eval_config=<path to eval yaml>"
     log_run_header(cfg, "eval")
