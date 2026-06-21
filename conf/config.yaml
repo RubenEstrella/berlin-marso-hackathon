@@ -9,6 +9,9 @@ num_envs: 8               # for eval/test; scale up as GPU allows
 device: cuda
 control_mode: pd_ee_delta_pos
 max_episode_steps: 200
+record_video: true
+tensorboard_logdir: null
+tensorboard_step: null
 
 # observation mode (state | rgb). Main track is STATE (privileged low-dim state vector);
 # rgb (scene image + proprioception) is the optional image track.

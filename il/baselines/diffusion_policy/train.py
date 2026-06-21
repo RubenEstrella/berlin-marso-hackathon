@@ -424,7 +424,15 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    env_kwargs = dict(control_mode=args.control_mode, reward_mode="sparse", obs_mode="state", render_mode="rgb_array", human_render_camera_configs=dict(shader_pack="default"))
+    env_kwargs = dict(
+        control_mode=args.control_mode,
+        reward_mode="sparse",
+        obs_mode="state",
+        render_mode="rgb_array" if args.capture_video else None,
+        render_backend="gpu" if args.capture_video else "none",
+    )
+    if args.capture_video:
+        env_kwargs["human_render_camera_configs"] = dict(shader_pack="default")
     env_kwargs.update(_demo_scene_kwargs)   # eval env matches the demos (parcels/bins/randomisation)
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps

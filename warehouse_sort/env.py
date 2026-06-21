@@ -11,6 +11,7 @@ import sapien
 import torch
 
 from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.render import utils as render_utils
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.registration import register_env
@@ -143,6 +144,8 @@ class WarehouseSortEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     def _load_lighting(self, options: dict):
+        if not render_utils.can_render(self._render_device):
+            return
         rng = self._batched_episode_rng
         lo, hi = self._rand["light_intensity"]
         inten = float(rng[0].uniform(lo, hi)) if hi > lo else float(lo)
@@ -159,9 +162,11 @@ class WarehouseSortEnv(BaseEnv):
         bx, by = self.bin_half
         h, t, ft = self.bin_wall_h, self.bin_wall_t, self.bin_floor_t
         builder = self.scene.create_actor_builder()
-        mat = sapien.render.RenderMaterial(base_color=[*color, 1.0])
+        can_render = render_utils.can_render(self._render_device)
+        mat = sapien.render.RenderMaterial(base_color=[*color, 1.0]) if can_render else None
         builder.add_box_collision(pose=sapien.Pose(p=[0, 0, ft]), half_size=[bx, by, ft])
-        builder.add_box_visual(pose=sapien.Pose(p=[0, 0, ft]), half_size=[bx, by, ft], material=mat)
+        if can_render:
+            builder.add_box_visual(pose=sapien.Pose(p=[0, 0, ft]), half_size=[bx, by, ft], material=mat)
         walls = [
             ([bx, 0, h], [t, by, h]),
             ([-bx, 0, h], [t, by, h]),
@@ -170,7 +175,8 @@ class WarehouseSortEnv(BaseEnv):
         ]
         for p, hs in walls:
             builder.add_box_collision(pose=sapien.Pose(p=p), half_size=hs)
-            builder.add_box_visual(pose=sapien.Pose(p=p), half_size=hs, material=mat)
+            if can_render:
+                builder.add_box_visual(pose=sapien.Pose(p=p), half_size=hs, material=mat)
         builder.initial_pose = sapien.Pose(p=[0, 0, 0])
         return builder.build_kinematic(name=name)
 
@@ -188,23 +194,26 @@ class WarehouseSortEnv(BaseEnv):
             tagcol = np.clip(np.array(TAG_BASE_COLORS[tag_id]) + t_off, 0.05, 0.98)
             b = self.scene.create_actor_builder()
             b.add_box_collision(half_size=[phx, phy, phz])
-            b.add_box_visual(
-                half_size=[phx, phy, phz],
-                material=sapien.render.RenderMaterial(base_color=[*cardboard.tolist(), 1.0]),
-            )
-            tag_x = phx - thx - 0.004
-            tag_y = phy - thy - 0.004
-            b.add_box_visual(
-                pose=sapien.Pose(p=[-tag_x, tag_y, phz + thz]),
-                half_size=[thx, thy, thz],
-                material=sapien.render.RenderMaterial(base_color=[*tagcol.tolist(), 1.0]),
-            )
+            if render_utils.can_render(self._render_device):
+                b.add_box_visual(
+                    half_size=[phx, phy, phz],
+                    material=sapien.render.RenderMaterial(base_color=[*cardboard.tolist(), 1.0]),
+                )
+                tag_x = phx - thx - 0.004
+                tag_y = phy - thy - 0.004
+                b.add_box_visual(
+                    pose=sapien.Pose(p=[-tag_x, tag_y, phz + thz]),
+                    half_size=[thx, thy, thz],
+                    material=sapien.render.RenderMaterial(base_color=[*tagcol.tolist(), 1.0]),
+                )
             b.set_scene_idxs([i])
             b.initial_pose = sapien.Pose(p=[0, 0, phz + 0.5 * i])  # spread to avoid init overlap
             per_env.append(b.build_dynamic(name=f"parcel_{idx}_env{i}"))
         return Actor.merge(per_env, name=f"parcel_{idx}")
 
     def _build_background(self):
+        if not render_utils.can_render(self._render_device):
+            return
         rng = self._batched_episode_rng
         table_colors = self._rand["table_colors"]
         floor_colors = self._rand["floor_colors"]

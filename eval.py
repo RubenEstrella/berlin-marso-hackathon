@@ -50,7 +50,26 @@ def main(cfg):
                   hard=(cfg.difficulty.name == "hard"))
     env.close()
 
-    # every eval run also saves a video (RecordEpisode, all views: render + scene sensor cam)
+    if cfg.get("tensorboard_logdir"):
+        from torch.utils.tensorboard import SummaryWriter
+
+        step = int(cfg.get("tensorboard_step") or 0)
+        writer = SummaryWriter(str(cfg.tensorboard_logdir))
+        for key, value in m.items():
+            if isinstance(value, (int, float)):
+                writer.add_scalar(f"eval/{key}", value, step)
+        writer.close()
+        print(
+            f"[eval] wrote metrics to TensorBoard at step {step}: "
+            f"{cfg.tensorboard_logdir}",
+            flush=True,
+        )
+
+    if not cfg.get("record_video", True):
+        print("[eval] record_video=false -> skipping video (numbers only)", flush=True)
+        return
+
+    # Video recording is optional because it requires a Vulkan renderer.
     out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     vid_dir = os.path.join(out_dir, "videos")
     n_vid = min(4, n_envs)

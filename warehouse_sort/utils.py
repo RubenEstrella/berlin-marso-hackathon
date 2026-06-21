@@ -13,6 +13,7 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 
 def _gym_make(cfg, obs_mode, randomization, n, render_mode):
+    render_backend = "none" if obs_mode == "state" and render_mode is None else "gpu"
     return gym.make(
         "WarehouseSort-v1",
         num_envs=n,
@@ -20,6 +21,7 @@ def _gym_make(cfg, obs_mode, randomization, n, render_mode):
         control_mode=cfg.control_mode,
         sim_backend="gpu",
         render_mode=render_mode,
+        render_backend=render_backend,
         reward_mode="sparse",
         max_episode_steps=cfg.max_episode_steps,
         difficulty=cfg.difficulty.name,
