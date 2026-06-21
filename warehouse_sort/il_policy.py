@@ -29,7 +29,7 @@ def _add_baseline_path(rel):
 # --------------------------------------------------------------------------- #
 class _DPPolicy:
     def __init__(self, net, scheduler, obs_horizon, pred_horizon, act_dim, device,
-                 act_horizon=1, num_inference_steps=100):
+                 act_horizon=1, num_inference_steps=100, obs_mean=None, obs_std=None):
         self.net = net.to(device).eval()
         self.scheduler = scheduler
         self.scheduler.set_timesteps(num_inference_steps)
@@ -38,6 +38,8 @@ class _DPPolicy:
         self.act_horizon = act_horizon
         self.act_dim = act_dim
         self.device = device
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
         self.prev = None
         self.action_chunk = None
         self.action_index = 0
@@ -50,6 +52,8 @@ class _DPPolicy:
     @torch.no_grad()
     def act(self, obs, deterministic=True):
         cur = (obs["state"] if isinstance(obs, dict) else obs).float().to(self.device)
+        if self.obs_mean is not None:
+            cur = (cur - self.obs_mean) / self.obs_std
         if self.prev is None or self.prev.shape != cur.shape:
             self.prev = cur
         previous = self.prev
@@ -83,6 +87,15 @@ def load_dp(checkpoint, sample_obs, action_space, device,
     from diffusion_policy.conditional_unet1d import ConditionalUnet1D
     from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    saved = ckpt.get("model_config", {})
+    obs_horizon = saved.get("obs_horizon", obs_horizon)
+    pred_horizon = saved.get("pred_horizon", pred_horizon)
+    diffusion_step_embed_dim = saved.get("diffusion_step_embed_dim", diffusion_step_embed_dim)
+    unet_dims = saved.get("unet_dims", unet_dims)
+    n_groups = saved.get("n_groups", n_groups)
+    num_diffusion_iters = saved.get("num_diffusion_iters", num_diffusion_iters)
+
     state = sample_obs["state"] if isinstance(sample_obs, dict) else sample_obs
     obs_dim = state.shape[1]
     act_dim = action_space.shape[0]
@@ -91,7 +104,6 @@ def load_dp(checkpoint, sample_obs, action_space, device,
         diffusion_step_embed_dim=diffusion_step_embed_dim,
         down_dims=list(unet_dims), n_groups=n_groups,
     )
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     sd = ckpt.get("ema_agent", ckpt.get("agent"))
     net_sd = {k.replace("noise_pred_net.", "", 1): v for k, v in sd.items()
               if k.startswith("noise_pred_net.")}
@@ -99,8 +111,11 @@ def load_dp(checkpoint, sample_obs, action_space, device,
     scheduler = DDPMScheduler(num_train_timesteps=num_diffusion_iters,
                               beta_schedule="squaredcos_cap_v2", clip_sample=True,
                               prediction_type="epsilon")
-    return _DPPolicy(net, scheduler, obs_horizon, pred_horizon, act_dim, device, act_horizon,
-                     num_inference_steps=num_inference_steps)
+    return _DPPolicy(
+        net, scheduler, obs_horizon, pred_horizon, act_dim, device, act_horizon,
+        num_inference_steps=num_inference_steps,
+        obs_mean=ckpt.get("obs_mean"), obs_std=ckpt.get("obs_std"),
+    )
 
 
 def load_dp_exec2(*args, **kwargs):

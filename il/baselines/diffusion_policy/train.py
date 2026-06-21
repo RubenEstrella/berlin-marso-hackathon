@@ -48,6 +48,14 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     skip_eval: bool = False
     """skip simulator evaluation and infer model shapes directly from the dataset"""
+    normalize_state: bool = True
+    """standardize every state feature using statistics from the demonstration dataset"""
+    grasp_oversample: int = 3
+    """sampling multiplier for action windows near a gripper-closing transition"""
+    grasp_window: int = 8
+    """steps before and after gripper closure considered grasp-focused"""
+    grasp_xyz_weight: float = 2.0
+    """XYZ denoising-loss multiplier for grasp-focused action windows"""
 
     env_id: str = "PegInsertionSide-v0"
     """the id of the environment"""
@@ -111,6 +119,26 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             for i in range(len(v)):
                 trajectories[k][i] = torch.Tensor(v[i]).to(device)
 
+        all_observations = torch.cat(trajectories['observations'], dim=0)
+        obs_mean = all_observations.mean(dim=0)
+        obs_std = all_observations.std(dim=0)
+        obs_std = torch.where(obs_std < 1e-6, torch.ones_like(obs_std), obs_std)
+        if args.normalize_state:
+            for observations in trajectories['observations']:
+                observations.sub_(obs_mean).div_(obs_std)
+            self.obs_mean, self.obs_std = obs_mean, obs_std
+        else:
+            self.obs_mean = torch.zeros_like(obs_mean)
+            self.obs_std = torch.ones_like(obs_std)
+
+        clipped_actions = 0
+        total_actions = 0
+        for actions in trajectories['actions']:
+            clipped_actions += int((actions.abs() > 1.0).sum().item())
+            total_actions += actions.numel()
+            actions.clamp_(-1.0, 1.0)
+        print(f"Clipped {clipped_actions}/{total_actions} demonstration action values to [-1, 1]")
+
         # Pre-compute all possible (traj_idx, start, end) tuples, this is very specific to Diffusion Policy
         if 'delta_pos' in args.control_mode or args.control_mode == 'base_pd_joint_vel_arm_pd_joint_vel':
             self.pad_action_arm = torch.zeros((trajectories['actions'][0].shape[1]-1,), device=device)
@@ -136,16 +164,26 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             pad_after = pred_horizon - obs_horizon
             # Pad after the trajectory, so all the observations are utilized in training
             # Note that in the original code, pad_after = act_horizon - 1, but I think this is not the best choice
-            self.slices += [
-                (traj_idx, start, start + pred_horizon) for start in range(-pad_before, L - pred_horizon + pad_after)
-            ]  # slice indices follow convention [start, end)
+            gripper = trajectories['actions'][traj_idx][:, -1]
+            closing_steps = torch.where(gripper[1:] < gripper[:-1] - 0.5)[0].add(1).tolist()
+            for start in range(-pad_before, L - pred_horizon + pad_after):
+                end = start + pred_horizon
+                grasp_focus = any(
+                    start <= close_step + args.grasp_window
+                    and end > close_step - args.grasp_window
+                    for close_step in closing_steps
+                )
+                item = (traj_idx, start, end, grasp_focus)
+                self.slices.append(item)
+                if grasp_focus:
+                    self.slices.extend([item] * max(0, args.grasp_oversample - 1))
 
         print(f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}")
 
         self.trajectories = trajectories
 
     def __getitem__(self, index):
-        traj_idx, start, end = self.slices[index]
+        traj_idx, start, end, grasp_focus = self.slices[index]
         L, act_dim = self.trajectories['actions'][traj_idx].shape
 
         obs_seq = self.trajectories['observations'][traj_idx][max(0, start):start+self.obs_horizon]
@@ -163,6 +201,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
         return {
             'observations': obs_seq,
             'actions': act_seq,
+            'grasp_focus': grasp_focus,
         }
 
     def __len__(self):
@@ -175,6 +214,7 @@ class Agent(nn.Module):
         self.obs_horizon = args.obs_horizon
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
+        self.grasp_xyz_weight = args.grasp_xyz_weight
         assert len(env.single_observation_space.shape) == 2 # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1 # (act_dim, )
         assert (env.single_action_space.high == 1).all() and (env.single_action_space.low == -1).all()
@@ -196,7 +236,7 @@ class Agent(nn.Module):
             prediction_type='epsilon' # predict noise (instead of denoised action)
         )
 
-    def compute_loss(self, obs_seq, action_seq):
+    def compute_loss(self, obs_seq, action_seq, grasp_focus=None):
         B = obs_seq.shape[0]
 
         # observation as FiLM conditioning
@@ -220,7 +260,12 @@ class Agent(nn.Module):
         noise_pred = self.noise_pred_net(
             noisy_action_seq, timesteps, global_cond=obs_cond)
 
-        return F.mse_loss(noise_pred, noise)
+        squared_error = F.mse_loss(noise_pred, noise, reduction='none')
+        if grasp_focus is not None and self.act_dim >= 3:
+            grasp_focus = grasp_focus.to(squared_error.device, dtype=squared_error.dtype)
+            xyz_weight = 1.0 + (self.grasp_xyz_weight - 1.0) * grasp_focus[:, None, None]
+            squared_error[:, :, :3] *= xyz_weight
+        return squared_error.mean()
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -263,6 +308,16 @@ def save_ckpt(run_name, tag):
     torch.save({
         'agent': agent.state_dict(),
         'ema_agent': ema_agent.state_dict(),
+        'obs_mean': dataset.obs_mean.detach().cpu(),
+        'obs_std': dataset.obs_std.detach().cpu(),
+        'model_config': {
+            'obs_horizon': args.obs_horizon,
+            'pred_horizon': args.pred_horizon,
+            'diffusion_step_embed_dim': args.diffusion_step_embed_dim,
+            'unet_dims': list(args.unet_dims),
+            'n_groups': args.n_groups,
+            'num_diffusion_iters': agent.num_diffusion_iters,
+        },
     }, f'runs/{run_name}/checkpoints/{tag}.pt')
 
 if __name__ == "__main__":
@@ -429,6 +484,7 @@ if __name__ == "__main__":
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)
+            grasp_focus=data_batch["grasp_focus"],
         )
         timings["forward"] += time.time() - last_tick
 
