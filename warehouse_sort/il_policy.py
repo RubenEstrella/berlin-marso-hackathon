@@ -23,44 +23,61 @@ def _add_baseline_path(rel):
 
 
 # --------------------------------------------------------------------------- #
-# State Diffusion Policy (MAIN track) — privileged low-dim state obs. Deployed fully
-# closed-loop: re-query every step, execute the first predicted action. The state vector
-# is parcel-count-specific, so a checkpoint is trained PER difficulty level.
+# State Diffusion Policy (MAIN track) — privileged low-dim state obs. The execution horizon
+# controls how often the policy replans. The state vector is parcel-count-specific, so a
+# checkpoint is trained PER difficulty level.
 # --------------------------------------------------------------------------- #
 class _DPPolicy:
     def __init__(self, net, scheduler, obs_horizon, pred_horizon, act_dim, device,
-                 num_inference_steps=16):
+                 act_horizon=1, num_inference_steps=100):
         self.net = net.to(device).eval()
         self.scheduler = scheduler
         self.scheduler.set_timesteps(num_inference_steps)
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
+        self.act_horizon = act_horizon
         self.act_dim = act_dim
         self.device = device
         self.prev = None
+        self.action_chunk = None
+        self.action_index = 0
+
+    def reset(self):
+        self.prev = None
+        self.action_chunk = None
+        self.action_index = 0
 
     @torch.no_grad()
     def act(self, obs, deterministic=True):
         cur = (obs["state"] if isinstance(obs, dict) else obs).float().to(self.device)
         if self.prev is None or self.prev.shape != cur.shape:
             self.prev = cur
-        hist = [self.prev, cur][-self.obs_horizon:]
-        while len(hist) < self.obs_horizon:
-            hist = [hist[0]] + hist
+        previous = self.prev
         self.prev = cur
-        obs_cond = torch.stack(hist, dim=1).flatten(start_dim=1)
-        B = cur.shape[0]
-        naction = torch.randn((B, self.pred_horizon, self.act_dim), device=self.device)
-        for k in self.scheduler.timesteps:
-            noise_pred = self.net(sample=naction, timestep=k, global_cond=obs_cond)
-            naction = self.scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
-        return naction[:, self.obs_horizon - 1].clamp(-1.0, 1.0)
+
+        if self.action_chunk is None or self.action_index >= self.action_chunk.shape[1]:
+            hist = [previous, cur][-self.obs_horizon:]
+            while len(hist) < self.obs_horizon:
+                hist = [hist[0]] + hist
+            obs_cond = torch.stack(hist, dim=1).flatten(start_dim=1)
+            B = cur.shape[0]
+            naction = torch.randn((B, self.pred_horizon, self.act_dim), device=self.device)
+            for k in self.scheduler.timesteps:
+                noise_pred = self.net(sample=naction, timestep=k, global_cond=obs_cond)
+                naction = self.scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+            start = self.obs_horizon - 1
+            self.action_chunk = naction[:, start:start + self.act_horizon]
+            self.action_index = 0
+
+        action = self.action_chunk[:, self.action_index]
+        self.action_index += 1
+        return action.clamp(-1.0, 1.0)
 
 
 def load_dp(checkpoint, sample_obs, action_space, device,
-            obs_horizon=2, pred_horizon=16, diffusion_step_embed_dim=64,
+            obs_horizon=2, act_horizon=1, pred_horizon=16, diffusion_step_embed_dim=64,
             unet_dims=(64, 128, 256), n_groups=8, num_diffusion_iters=100,
-            num_inference_steps=16):
+            num_inference_steps=100):
     """Load a state Diffusion Policy checkpoint (uses EMA weights)."""
     _add_baseline_path("diffusion_policy")
     from diffusion_policy.conditional_unet1d import ConditionalUnet1D
@@ -82,8 +99,23 @@ def load_dp(checkpoint, sample_obs, action_space, device,
     scheduler = DDPMScheduler(num_train_timesteps=num_diffusion_iters,
                               beta_schedule="squaredcos_cap_v2", clip_sample=True,
                               prediction_type="epsilon")
-    return _DPPolicy(net, scheduler, obs_horizon, pred_horizon, act_dim, device,
+    return _DPPolicy(net, scheduler, obs_horizon, pred_horizon, act_dim, device, act_horizon,
                      num_inference_steps=num_inference_steps)
+
+
+def load_dp_exec2(*args, **kwargs):
+    kwargs["act_horizon"] = 2
+    return load_dp(*args, **kwargs)
+
+
+def load_dp_exec4(*args, **kwargs):
+    kwargs["act_horizon"] = 4
+    return load_dp(*args, **kwargs)
+
+
+def load_dp_exec8(*args, **kwargs):
+    kwargs["act_horizon"] = 8
+    return load_dp(*args, **kwargs)
 
 
 # --------------------------------------------------------------------------- #

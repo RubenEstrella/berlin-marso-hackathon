@@ -77,6 +77,8 @@ def rollout_metrics(env, agent, device, n_episodes, seeds, max_steps, determinis
         if take < nb:
             batch_seeds = batch_seeds + all_seeds[: nb - take]
         obs, _ = env.reset(seed=batch_seeds)
+        if hasattr(agent, "reset"):
+            agent.reset()
         obs = to_device(obs, device)
         for _ in range(max_steps - 1):
             obs, _, _, _, _ = env.step(agent.act(obs, deterministic=deterministic))

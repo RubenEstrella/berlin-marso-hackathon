@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from gymnasium import spaces
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from diffusion_policy.evaluate import evaluate
@@ -45,6 +46,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    skip_eval: bool = False
+    """skip simulator evaluation and infer model shapes directly from the dataset"""
 
     env_id: str = "PegInsertionSide-v0"
     """the id of the environment"""
@@ -306,7 +309,9 @@ if __name__ == "__main__":
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = dict(obs_horizon=args.obs_horizon)
-    envs = make_eval_envs(args.env_id, args.num_eval_envs, args.sim_backend, env_kwargs, other_kwargs, video_dir=f'runs/{run_name}/videos' if args.capture_video else None)
+    envs = None
+    if not args.skip_eval:
+        envs = make_eval_envs(args.env_id, args.num_eval_envs, args.sim_backend, env_kwargs, other_kwargs, video_dir=f'runs/{run_name}/videos' if args.capture_video else None)
 
     if args.track:
         import wandb
@@ -342,6 +347,17 @@ if __name__ == "__main__":
     if args.num_demos is None:
         args.num_demos = len(dataset)
 
+    if args.skip_eval:
+        sample = dataset[0]
+        obs_shape = tuple(sample["observations"].shape)
+        act_dim = int(sample["actions"].shape[-1])
+
+        class DatasetSpaces:
+            single_observation_space = spaces.Box(-np.inf, np.inf, shape=obs_shape, dtype=np.float32)
+            single_action_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
+
+        envs = DatasetSpaces()
+
     # agent setup
     agent = Agent(envs, args).to(device)
     optimizer = optim.AdamW(params=agent.parameters(),
@@ -366,6 +382,8 @@ if __name__ == "__main__":
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
+        if args.skip_eval:
+            return
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
@@ -441,5 +459,7 @@ if __name__ == "__main__":
     evaluate_and_save_best(args.total_iters)
     log_metrics(args.total_iters)
 
-    envs.close()
+    save_ckpt(run_name, "latest")
+    if not args.skip_eval:
+        envs.close()
     writer.close()
