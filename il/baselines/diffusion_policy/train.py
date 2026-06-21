@@ -52,10 +52,14 @@ class Args:
     """standardize every state feature using statistics from the demonstration dataset"""
     grasp_oversample: int = 3
     """sampling multiplier for action windows near a gripper-closing transition"""
-    grasp_window: int = 8
-    """steps before and after gripper closure considered grasp-focused"""
+    grasp_pre_steps: int = 10
+    """steps before gripper closure considered grasp-focused"""
+    grasp_post_steps: int = 20
+    """steps after gripper closure considered grasp/lift-focused"""
     grasp_xyz_weight: float = 2.0
     """XYZ denoising-loss multiplier for grasp-focused action windows"""
+    lift_z_weight: float = 5.0
+    """Z denoising-loss multiplier for upward actions immediately after closure"""
 
     env_id: str = "PegInsertionSide-v0"
     """the id of the environment"""
@@ -148,6 +152,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
         #     raise NotImplementedError(f'Control Mode {args.control_mode} not supported')
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = args.obs_horizon, args.pred_horizon
         self.slices = []
+        self.closing_steps = []
         num_traj = len(trajectories['actions'])
         total_transitions = 0
         for traj_idx in range(num_traj):
@@ -166,11 +171,12 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             # Note that in the original code, pad_after = act_horizon - 1, but I think this is not the best choice
             gripper = trajectories['actions'][traj_idx][:, -1]
             closing_steps = torch.where(gripper[1:] < gripper[:-1] - 0.5)[0].add(1).tolist()
+            self.closing_steps.append(closing_steps)
             for start in range(-pad_before, L - pred_horizon + pad_after):
                 end = start + pred_horizon
                 grasp_focus = any(
-                    start <= close_step + args.grasp_window
-                    and end > close_step - args.grasp_window
+                    start < close_step + args.grasp_post_steps
+                    and end > close_step - args.grasp_pre_steps
                     for close_step in closing_steps
                 )
                 item = (traj_idx, start, end, grasp_focus)
@@ -198,10 +204,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             act_seq = torch.cat([act_seq, pad_action.repeat(end-L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         assert obs_seq.shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon
+        action_steps = torch.arange(start, end, device=act_seq.device)
+        post_close = torch.zeros(self.pred_horizon, dtype=torch.bool, device=act_seq.device)
+        for close_step in self.closing_steps[traj_idx]:
+            post_close |= (
+                (action_steps >= close_step)
+                & (action_steps < close_step + args.grasp_post_steps)
+            )
+        lift_focus = post_close & (act_seq[:, 2] > 0.0)
         return {
             'observations': obs_seq,
             'actions': act_seq,
             'grasp_focus': grasp_focus,
+            'lift_focus': lift_focus,
         }
 
     def __len__(self):
@@ -215,6 +230,7 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.grasp_xyz_weight = args.grasp_xyz_weight
+        self.lift_z_weight = args.lift_z_weight
         assert len(env.single_observation_space.shape) == 2 # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1 # (act_dim, )
         assert (env.single_action_space.high == 1).all() and (env.single_action_space.low == -1).all()
@@ -236,7 +252,7 @@ class Agent(nn.Module):
             prediction_type='epsilon' # predict noise (instead of denoised action)
         )
 
-    def compute_loss(self, obs_seq, action_seq, grasp_focus=None):
+    def compute_loss(self, obs_seq, action_seq, grasp_focus=None, lift_focus=None):
         B = obs_seq.shape[0]
 
         # observation as FiLM conditioning
@@ -265,6 +281,10 @@ class Agent(nn.Module):
             grasp_focus = grasp_focus.to(squared_error.device, dtype=squared_error.dtype)
             xyz_weight = 1.0 + (self.grasp_xyz_weight - 1.0) * grasp_focus[:, None, None]
             squared_error[:, :, :3] *= xyz_weight
+        if lift_focus is not None and self.act_dim >= 3:
+            lift_focus = lift_focus.to(squared_error.device, dtype=squared_error.dtype)
+            z_weight = 1.0 + (self.lift_z_weight - 1.0) * lift_focus
+            squared_error[:, :, 2] *= z_weight
         return squared_error.mean()
 
     def get_action(self, obs_seq):
@@ -317,6 +337,14 @@ def save_ckpt(run_name, tag):
             'unet_dims': list(args.unet_dims),
             'n_groups': args.n_groups,
             'num_diffusion_iters': agent.num_diffusion_iters,
+        },
+        'training_config': {
+            'normalize_state': args.normalize_state,
+            'grasp_oversample': args.grasp_oversample,
+            'grasp_pre_steps': args.grasp_pre_steps,
+            'grasp_post_steps': args.grasp_post_steps,
+            'grasp_xyz_weight': args.grasp_xyz_weight,
+            'lift_z_weight': args.lift_z_weight,
         },
     }, f'runs/{run_name}/checkpoints/{tag}.pt')
 
@@ -485,6 +513,7 @@ if __name__ == "__main__":
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)
             grasp_focus=data_batch["grasp_focus"],
+            lift_focus=data_batch["lift_focus"],
         )
         timings["forward"] += time.time() - last_tick
 
