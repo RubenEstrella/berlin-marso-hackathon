@@ -154,7 +154,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
         #     raise NotImplementedError(f'Control Mode {args.control_mode} not supported')
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = args.obs_horizon, args.pred_horizon
         self.slices = []
-        self.closing_steps = []
+        self.lift_steps = []
         num_traj = len(trajectories['actions'])
         total_transitions = 0
         for traj_idx in range(num_traj):
@@ -173,7 +173,13 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             # Note that in the original code, pad_after = act_horizon - 1, but I think this is not the best choice
             gripper = trajectories['actions'][traj_idx][:, -1]
             closing_steps = torch.where(gripper[1:] < gripper[:-1] - 0.5)[0].add(1).tolist()
-            self.closing_steps.append(closing_steps)
+            lift_steps = torch.zeros(L, dtype=torch.bool, device=device)
+            for close_step in closing_steps:
+                lift_end = min(L, close_step + args.grasp_post_steps)
+                lift_steps[close_step:lift_end] = (
+                    trajectories['actions'][traj_idx][close_step:lift_end, 2] > 0.0
+                )
+            self.lift_steps.append(lift_steps)
             for start in range(-pad_before, L - pred_horizon + pad_after):
                 end = start + pred_horizon
                 grasp_focus = any(
@@ -206,14 +212,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             act_seq = torch.cat([act_seq, pad_action.repeat(end-L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         assert obs_seq.shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon
-        action_steps = torch.arange(start, end, device=act_seq.device)
-        post_close = torch.zeros(self.pred_horizon, dtype=torch.bool, device=act_seq.device)
-        for close_step in self.closing_steps[traj_idx]:
-            post_close |= (
-                (action_steps >= close_step)
-                & (action_steps < close_step + args.grasp_post_steps)
-            )
-        lift_focus = post_close & (act_seq[:, 2] > 0.0)
+        lift_focus = self.lift_steps[traj_idx][max(0, start):end]
+        if start < 0:
+            lift_focus = torch.cat([
+                torch.zeros(-start, dtype=torch.bool, device=act_seq.device),
+                lift_focus,
+            ])
+        if end > L:
+            lift_focus = torch.cat([
+                lift_focus,
+                torch.zeros(end - L, dtype=torch.bool, device=act_seq.device),
+            ])
+        assert lift_focus.shape[0] == self.pred_horizon
         return {
             'observations': obs_seq,
             'actions': act_seq,
