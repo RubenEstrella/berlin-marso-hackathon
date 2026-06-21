@@ -69,6 +69,8 @@ class Args:
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
+    init_checkpoint: Optional[str] = None
+    """warm-start from shape-compatible EMA weights in an existing checkpoint"""
     total_iters: int = 1_000_000
     """total timesteps of the experiment"""
     batch_size: int = 1024
@@ -322,6 +324,30 @@ class Agent(nn.Module):
         end = start + self.act_horizon
         return noisy_action_seq[:, start:end] # (B, act_horizon, act_dim)
 
+
+def load_compatible_weights(module, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    source = checkpoint.get('ema_agent', checkpoint.get('agent'))
+    target = module.state_dict()
+    compatible = {
+        key: value for key, value in source.items()
+        if key in target and target[key].shape == value.shape
+    }
+    mismatched = [
+        key for key, value in source.items()
+        if key in target and target[key].shape != value.shape
+    ]
+    unexpected = [key for key in source if key not in target]
+    missing = [key for key in target if key not in compatible]
+    module.load_state_dict(compatible, strict=False)
+    print(
+        f"Warm-started {len(compatible)}/{len(target)} tensors from {checkpoint_path}; "
+        f"reinitialized {len(missing)} ({len(mismatched)} shape changes, "
+        f"{len(unexpected)} unexpected)."
+    )
+    if mismatched:
+        print("Shape-changed tensors:", ", ".join(mismatched))
+
 def save_ckpt(run_name, tag):
     os.makedirs(f'runs/{run_name}/checkpoints', exist_ok=True)
     ema.copy_to(ema_agent.parameters())
@@ -339,6 +365,7 @@ def save_ckpt(run_name, tag):
             'num_diffusion_iters': agent.num_diffusion_iters,
         },
         'training_config': {
+            'init_checkpoint': args.init_checkpoint,
             'normalize_state': args.normalize_state,
             'grasp_oversample': args.grasp_oversample,
             'grasp_pre_steps': args.grasp_pre_steps,
@@ -443,6 +470,8 @@ if __name__ == "__main__":
 
     # agent setup
     agent = Agent(envs, args).to(device)
+    if args.init_checkpoint:
+        load_compatible_weights(agent, args.init_checkpoint, device)
     optimizer = optim.AdamW(params=agent.parameters(),
         lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6)
 
@@ -459,6 +488,7 @@ if __name__ == "__main__":
     # holds a copy of the model weights
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
     ema_agent = Agent(envs, args).to(device)
+    ema_agent.load_state_dict(agent.state_dict())
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)

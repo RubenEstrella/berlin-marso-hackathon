@@ -5,11 +5,11 @@ baseline_dir: diffusion_policy
 script: train.py
 demo_kind: state
 flags:
-  total_iters: 30000
+  total_iters: 50000
   batch_size: 256
-  obs_horizon: 2
-  act_horizon: 8
-  pred_horizon: 16
+  obs_horizon: 3
+  act_horizon: 5
+  pred_horizon: 20
   normalize_state: true
   grasp_oversample: 3
   grasp_pre_steps: 10
